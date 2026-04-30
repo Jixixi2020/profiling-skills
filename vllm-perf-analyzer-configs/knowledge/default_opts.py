@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Layer1 默认优化项定义 — 强制组 5 项 + 测试组 19 项。
+
+每项结构:
+  id: 唯一标识
+  name: 显示名称
+  config: 配置方式描述（用于生成 serve_script）
+  enabled_check: 检测是否已启用 {type: "env_var"|"serve_arg"|"additional_config_key", ...}
+  moe_only: 是否仅 MoE 模型适用
+  reason: 强制开启原因（仅 forced 组）
+  conflicts_with: 冲突项 ID 列表（仅 testable 组）
+  requires: 前置条件（仅 testable 组）
+  special_handling: 特殊处理说明（仅 testable 组）
+"""
+
+# ============================================================
+# 强制开启组（不测试性能，直接使能）
+# ============================================================
+FORCED_OPTS = [
+    {
+        "id": "expandable_segments",
+        "name": "显存碎片优化",
+        "config": 'export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"',
+        "enabled_check": {"type": "env_var", "var": "PYTORCH_NPU_ALLOC_CONF"},
+        "moe_only": False,
+        "reason": "减少显存碎片，无副作用",
+    },
+    {
+        "id": "hccl_comm_opt",
+        "name": "通信优化",
+        "config": 'export HCCL_OP_EXPANSION_MODE="AIV"\nexport HCCL_BUFFSIZE=1024',
+        "enabled_check": {"type": "env_var", "var": "HCCL_OP_EXPANSION_MODE"},
+        "moe_only": False,
+        "reason": "HCCL 通信优化，提升集合通信效率",
+    },
+    {
+        "id": "moe_ep",
+        "name": "MoE EP",
+        "config": "--enable-expert-parallel",
+        "enabled_check": {"type": "serve_arg", "arg": "--enable-expert-parallel"},
+        "moe_only": True,
+        "reason": "MoE 模型必须开启 EP 以分散专家负载",
+    },
+    {
+        "id": "cpu_binding",
+        "name": "free 优化（CPU 绑核）",
+        "config": """--additional-config '{"enable_cpu_binding":true}'""",
+        "enabled_check": {"type": "additional_config_key", "key": "enable_cpu_binding"},
+        "moe_only": False,
+        "reason": "减少 CPU 调度抖动导致的 Free 时间",
+    },
+    {
+        "id": "chunk_prefill",
+        "name": "chunk_prefill 调度",
+        "config": """--additional-config '{"ascend_scheduler_config":{"enabled":false,"enable_chunked_prefill":true}}'""",
+        "enabled_check": {"type": "additional_config_key", "key": "enable_chunked_prefill"},
+        "moe_only": False,
+        "reason": "分块 prefill 减少长序列对 decode 的阻塞",
+    },
+]
+
+# ============================================================
+# 逐项测试组（代理指标测试，劣化回滚）
+# ============================================================
+TESTABLE_OPTS = [
+    {
+        "id": "graph_mode",
+        "name": "图模式",
+        "config": """--compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16,32,64],"cudagraph_mode":"FULL_DECODE_ONLY"}'""",
+        "test_config": """--compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16,32,64],"cudagraph_mode":"FULL_DECODE_ONLY"}'""",
+        "enabled_check": {"type": "serve_arg", "arg": "--compilation-config"},
+        "conflicts_with": ["task_queue_2"],
+        "requires": {},
+        "moe_only": False,
+        "special_handling": "graph_vs_taskqueue",
+    },
+    {
+        "id": "task_queue_2",
+        "name": "TASK_QUEUE_ENABLE=2",
+        "config": "export TASK_QUEUE_ENABLE=2",
+        "test_config": "export TASK_QUEUE_ENABLE=2\n--enforce-eager\n--remove-compilation",
+        "enabled_check": {"type": "env_var", "var": "TASK_QUEUE_ENABLE", "value": "2"},
+        "conflicts_with": ["graph_mode"],
+        "requires": {},
+        "moe_only": False,
+        "special_handling": "graph_vs_taskqueue",
+    },
+    {
+        "id": "async_scheduling",
+        "name": "async_scheduling",
+        "config": "--async-scheduling",
+        "test_config": "--async-scheduling",
+        "enabled_check": {"type": "serve_arg", "arg": "--async-scheduling"},
+        "conflicts_with": [],
+        "requires": {},
+        "moe_only": False,
+        "special_handling": "",
+    },
+    {
+        "id": "flashcomm1",
+        "name": "FLASHCOMM1",
+        "config": "export VLLM_ASCEND_ENABLE_FLASHCOMM1=1",
+        "test_config": "export VLLM_ASCEND_ENABLE_FLASHCOMM1=1",
+        "enabled_check": {"type": "env_var", "var": "VLLM_ASCEND_ENABLE_FLASHCOMM1"},
+        "conflicts_with": [],
+        "requires": {},
+        "moe_only": False,
+        "special_handling": "",
+    },
+    {
+        "id": "matmul_allreduce",
+        "name": "MatMul+AllReduce 融合",
+        "config": "export VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE=1",
+        "test_config": "export VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE=1",
+        "enabled_check": {"type": "env_var", "var": "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE"},
+        "conflicts_with": [],
+        "requires": {},
+        "moe_only": False,
+        "special_handling": "",
+    },
+    {
+        "id": "fused_mc2",
+        "name": "Fused MC2",
+        "config": "export VLLM_ASCEND_ENABLE_FUSED_MC2=1",
+        "test_config": "export VLLM_ASCEND_ENABLE_FUSED_MC2=1",
+        "enabled_check": {"type": "env_var", "var": "VLLM_ASCEND_ENABLE_FUSED_MC2"},
+        "conflicts_with": [],
+        "requires": {},
+        "moe_only": False,
+        "special_handling": "",
+    },
+    {
+        "id": "fuse_allreduce_rms",
+        "name": "fuse_allreduce_rms",
+        "config": """--additional-config '{"ascend_compilation_config":{"fuse_allreduce_rms":true}}'""",
+        "test_config": """--additional-config '{"ascend_compilation_config":{"fuse_allreduce_rms":true}}'""",
+        "enabled_check": {"type": "additional_config_key", "key": "fuse_allreduce_rms"},
+        "conflicts_with": [],
+        "requires": {},
+        "moe_only": False,
+        "special_handling": "",
+    },
+    {
+        "id": "prefetch_mlp_weight",
+        "name": "prefetch MLP + weight",
+        "config": "export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1\n--additional-config '{\"weight_prefetch_config\":{\"enabled\":true}}'",
+        "test_config": "export VLLM_ASCEND_ENABLE_PREFETCH_MLP=1\n--additional-config '{\"weight_prefetch_config\":{\"enabled\":true}}'",
+        "enabled_check": {"type": "env_var", "var": "VLLM_ASCEND_ENABLE_PREFETCH_MLP"},
+        "conflicts_with": [],
+        "requires": {},
+        "moe_only": False,
+        "special_handling": "",
+    },
+    {
+        "id": "dynamic_eplb",
+        "name": "MoE EP 负载均衡",
+        "config": 'export DYNAMIC_EPLB="true"\n--additional-config \'{"dynamic_eplb":true}\'',
+        "test_config": 'export DYNAMIC_EPLB="true"\n--additional-config \'{"dynamic_eplb":true}\'',
+        "enabled_check": {"type": "env_var", "var": "DYNAMIC_EPLB"},
+        "conflicts_with": [],
+        "requires": {"ep": True},
+        "moe_only": True,
+        "special_handling": "",
+    },
+    {
+        "id": "dbo",
+        "name": "DBO 通算掩盖",
+        "config": "export VLLM_ASCEND_ENABLE_DBO=1",
+        "test_config": "export VLLM_ASCEND_ENABLE_DBO=1",
+        "enabled_check": {"type": "env_var", "var": "VLLM_ASCEND_ENABLE_DBO"},
+        "conflicts_with": [],
+        "requires": {},
+        "moe_only": False,
+        "special_handling": "",
+    },
+    {
+        "id": "context_parallel",
+        "name": "长序列 Context Parallel",
+        "config": "export VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL=1",
+        "test_config": "export VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL=1",
+        "enabled_check": {"type": "env_var", "var": "VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL"},
+        "conflicts_with": [],
+        "requires": {},
+        "moe_only": False,
+        "special_handling": "",
+    },
+    {
+        "id": "balance_scheduling",
+        "name": "多卡调度均衡",
+        "config": "export VLLM_ASCEND_BALANCE_SCHEDULING=1",
+        "test_config": "export VLLM_ASCEND_BALANCE_SCHEDULING=1",
+        "enabled_check": {"type": "env_var", "var": "VLLM_ASCEND_BALANCE_SCHEDULING"},
+        "conflicts_with": [],
+        "requires": {},
+        "moe_only": False,
+        "special_handling": "",
+    },
+    {
+        "id": "shared_expert_dp",
+        "name": "共享专家 DP",
+        "config": """--additional-config '{"enable_shared_expert_dp":true}'""",
+        "test_config": """--additional-config '{"enable_shared_expert_dp":true}'""",
+        "enabled_check": {"type": "additional_config_key", "key": "enable_shared_expert_dp"},
+        "conflicts_with": [],
+        "requires": {"ep": True, "tp_gt_1": True},
+        "moe_only": True,
+        "special_handling": "",
+    },
+    {
+        "id": "multistream_overlap_gate",
+        "name": "MoE 多流 overlap gate",
+        "config": """--additional-config '{"multistream_overlap_gate":true}'""",
+        "test_config": """--additional-config '{"multistream_overlap_gate":true}'""",
+        "enabled_check": {"type": "additional_config_key", "key": "multistream_overlap_gate"},
+        "conflicts_with": [],
+        "requires": {},
+        "moe_only": True,
+        "special_handling": "",
+    },
+    {
+        "id": "multistream_overlap_shared_expert",
+        "name": "MoE 多流 overlap 共享专家",
+        "config": """--additional-config '{"multistream_overlap_shared_expert":true}'""",
+        "test_config": """--additional-config '{"multistream_overlap_shared_expert":true}'""",
+        "enabled_check": {"type": "additional_config_key", "key": "multistream_overlap_shared_expert"},
+        "conflicts_with": [],
+        "requires": {},
+        "moe_only": True,
+        "special_handling": "",
+    },
+    {
+        "id": "async_exponential",
+        "name": "异步指数运算",
+        "config": """--additional-config '{"enable_async_exponential":true}'""",
+        "test_config": """--additional-config '{"enable_async_exponential":true}'""",
+        "enabled_check": {"type": "additional_config_key", "key": "enable_async_exponential"},
+        "conflicts_with": [],
+        "requires": {},
+        "moe_only": False,
+        "special_handling": "",
+    },
+]
