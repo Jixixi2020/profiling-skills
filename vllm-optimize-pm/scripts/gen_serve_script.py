@@ -170,6 +170,7 @@ def parse_serve_script(content: str) -> dict:
     simple_args = OrderedDict()
     additional_config = {}
     compilation_config = None
+    speculative_config = None
 
     # 跳过 'vllm' 'serve'
     start = 0
@@ -194,6 +195,16 @@ def parse_serve_script(content: str) -> dict:
                     additional_config = json.loads(tokens[i + 1])
                 except (json.JSONDecodeError, TypeError):
                     simple_args[t] = tokens[i + 1]
+                i += 2
+                continue
+
+        # --speculative-config 特殊处理
+        if t in ('--speculative-config', '--speculative_config'):
+            if i + 1 < len(tokens):
+                try:
+                    speculative_config = json.loads(tokens[i + 1])
+                except (json.JSONDecodeError, TypeError):
+                    speculative_config = {"raw": tokens[i + 1]}
                 i += 2
                 continue
 
@@ -233,6 +244,7 @@ def parse_serve_script(content: str) -> dict:
         "simple_args": simple_args,
         "additional_config": additional_config,
         "compilation_config": compilation_config,
+        "speculative_config": speculative_config,
     }
 
 
@@ -383,6 +395,15 @@ def generate_script(parsed: dict) -> str:
     if parsed["additional_config"]:
         j = json.dumps(parsed["additional_config"], ensure_ascii=False)
         arg_lines.append(f"    --additional-config '{j}'")
+
+    # speculative_config
+    if parsed.get("speculative_config") is not None:
+        sc = parsed["speculative_config"]
+        if "raw" in sc:
+            arg_lines.append(f"    --speculative-config '{sc['raw']}'")
+        else:
+            j = json.dumps(sc, ensure_ascii=False)
+            arg_lines.append(f"    --speculative-config '{j}'")
 
     # compilation_config
     if parsed["compilation_config"] is not None:
