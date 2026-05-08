@@ -42,16 +42,58 @@ arguments:
 即使前 N 项全部 ROLLBACK，仍必须继续尝试到第 5 项。
 不满 5 项不得标记 L4 为 completed。
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 每项优化必须执行完整的 apply → measure → judge 流程:
   1) apply: 在容器内应用代码修改 (apply_code_fix.sh)
   2) measure: 运行 run_measurement.sh 采集性能数据
   3) judge: 使用 latency_judge.py 或 throughput_judge.py 判定 KEEP/ROLLBACK
 
-禁止行为:
-  - 禁止将优化项标记为 "ANALYZED_NOT_TESTED"（分析但未测试）。这是变相 SKIP，不计入 original_code_fixes
-  - 禁止以"测量精度不足"或"预期收益低于测量阈值"为由跳过测试
-  - 如果测量精度确实限制判定（如 latency 恒定值），仍必须执行 apply → measure → judge，
-    将测量结果如实记录，判定为 ROLLBACK，并在 reason 中说明测量精度限制
+绝对禁止:
+  ✗ 禁止将优化项标记为 "ANALYZED_NOT_TESTED"。这不是合法的 result 值。
+  ✗ 禁止以"测量精度不足"为由跳过 measure + judge。
+  ✗ 禁止以"预期收益低于测量阈值"为由跳过 measure + judge。
+  ✗ 禁止以"风险太高"为由跳过 measure + judge。风险评级只影响修改方案的设计，
+    不影响是否执行测试。高风险项也必须走完 apply → measure → judge。
+
+唯一合法的 result 值: "KEEP" 或 "ROLLBACK"
+  - 任何其他值（ANALYZED_NOT_TESTED、PENDING、SKIP 等）均视为无效，
+    quality-inspector 将直接 FAIL，且该项不计入 optimizations_tested。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+测量精度限制时的强制处理流程:
+
+当 latency 测量返回恒定值（方差为 0）时，以下行为均为违规:
+  ✗ 在 measure 之前就预判"测不出来"并跳过
+  ✗ 只做分析然后标记 ANALYZED_NOT_TESTED
+  ✗ 只测 1 项确认"确实测不出来"后，其余 4 项不测
+
+正确流程（必须逐项执行，不可批量豁免）:
+  1) apply: 正常应用代码修改
+  2) measure-latency: 运行 profiling 模式采集 latency
+  3) 如果 latency 无变化（0% 或 ±1% 内）→ 进入第 4 步
+  4) measure-throughput: 必须 fallback 到多请求 throughput 测量
+     （使用 benchmark 脚本 + throughput_judge.py）
+  5) judge: 基于 throughput 结果判定 KEEP/ROLLBACK
+  6) 如果 throughput 也无变化 → 判定为 ROLLBACK，reason 记录:
+     "Latency unchanged (0.0%), throughput unchanged (0.0%).
+      Optimization effect below measurement detection threshold."
+  7) ROLLBACK 代码修改，继续下一项
+
+此流程每项独立执行。第 N 项 ROLLBACK 不能成为跳过第 N+1 项的理由。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+完成自检（标记 completed 之前必须逐项确认）:
+
+在 Step 4 写 state.json 之前，必须执行以下自检，全部 PASS 才能标记 completed:
+  □ tested_items_detail 数组长度 >= 5
+  □ 数组中每一项的 result 字段值均为 "KEEP" 或 "ROLLBACK"
+  □ 不存在 result="ANALYZED_NOT_TESTED" 的条目
+  □ optimizations_tested >= 5（等于 tested_items_detail 数组长度）
+  □ 每项的 prev_value、curr_value、delta_pct 字段均有实际数值（非 null，非 0/0）
+  □ 每项的 profing 或 throughput 测量数据文件存在于 layer4/ 目录下
+
+自检不通过 → 回到 Step 3 补测 → 重新自检 → 直到全部 PASS。
+禁止在自检未通过的情况下写 status="completed"。
 ```
 
 本 skill 可由 PM 自动 dispatch，也可作为独立 skill 直接调用。
@@ -271,6 +313,19 @@ docker exec $container grep -rn "\.transpose(" $vllm_ascend_src/ --include="*.py
 
 ### Step 3: 逐项测试（>= 5 项原创代码优化）
 
+**⚠️ 执行前硬性检查：**
+
+在开始 Step 3 之前，必须确认以下条件全部满足，否则不得开始测试：
+
+```
+□ Step 1 双模式 profiling 的 profiling_decode_perf.json 和 profiling_multi_perf.json 均存在
+□ Step 2 的 6 步方法论全部完成，每步有对应的分析输出文件
+□ 优化建议列表 >= 5 项，且每项都已通过原创性自检
+□ 每项建议已指定测试模式（single 或 script）+ 预期使用的 judge 脚本
+```
+
+**禁止复用其他 Layer 的 profiling 数据。** L4 必须基于自己 Step 1 采集的双模式 profiling 数据进行全部分析和决策。
+
 对每项优化建议，编号 N（从 1 到至少 5）:
 
 #### 3a. 生成代码修改
@@ -359,6 +414,76 @@ KEEP: 更新 PREV_PERF，记录到 kept_opts。
 （注意：不再直接写入 skills 知识库目录。PM 收尾阶段会将案例文件复制到知识库。）
 
 **即使前 N 项全部 ROLLBACK，仍必须继续尝试到第 5 项。**
+
+### Step 3.5: 完成自检（标记 completed 前强制执行）
+
+在 Step 4 更新 state.json 之前，必须执行以下自检。**全部 PASS 才能进入 Step 4。** 任何一项 FAIL → 回到 Step 3 补测缺失项。
+
+```bash
+# 自检脚本：验证 results.json 合法性
+python3 -c "
+import json, sys, os
+
+base_dir = '$base_dir'
+results_path = os.path.join(base_dir, 'layer4/results.json')
+
+# 1. 文件存在
+if not os.path.exists(results_path):
+    print('FAIL: results.json not found')
+    sys.exit(1)
+
+with open(results_path) as f:
+    d = json.load(f)
+
+# 2. 检查 tested_items_detail
+items = d.get('tested_items_detail', [])
+if len(items) < 5:
+    print(f'FAIL: tested_items_detail length={len(items)}, need >=5')
+    sys.exit(1)
+
+# 3. 每项的 result 必须是 KEEP 或 ROLLBACK
+for item in items:
+    result = item.get('result', 'MISSING')
+    if result not in ('KEEP', 'ROLLBACK'):
+        print(f'FAIL: item \"{item.get(\"name\")}\" has result=\"{result}\", must be KEEP or ROLLBACK')
+        sys.exit(1)
+
+# 4. 每项必须有实际测量数值
+for item in items:
+    prev = item.get('prev_value', 0)
+    curr = item.get('curr_value', 0)
+    if prev == 0 and curr == 0:
+        print(f'FAIL: item \"{item.get(\"name\")}\" has prev_value=0 and curr_value=0 (not measured)')
+        sys.exit(1)
+
+# 5. optimizations_tested 一致性
+tested = d.get('optimizations_tested', 0)
+if tested != len(items):
+    print(f'FAIL: optimizations_tested={tested} but tested_items_detail has {len(items)} items')
+    sys.exit(1)
+
+# 6. 合法 result 值统计
+kept = sum(1 for i in items if i.get('result') == 'KEEP')
+rollback = sum(1 for i in items if i.get('result') == 'ROLLBACK')
+other = len(items) - kept - rollback
+if other > 0:
+    print(f'FAIL: {other} items have invalid result value (not KEEP/ROLLBACK)')
+    sys.exit(1)
+
+print(f'SELF-CHECK PASS: {len(items)} items tested ({kept} KEEP, {rollback} ROLLBACK)')
+print('Ready to proceed to Step 4.')
+"
+```
+
+**自检不通过时的处理：**
+- 如果某项 result 不是 KEEP/ROLLBACK → 该项未完成测试，必须回到 Step 3 补测
+- 如果某两项 prev_value/curr_value 相同但未跑 throughput fallback → 必须补跑 throughput 测量
+- 如果 tested_items_detail 不足 5 项 → 必须追加新优化项并完成测试
+
+**禁止行为：**
+- 禁止在自检 FAIL 的情况下执行 Step 4
+- 禁止修改 results.json 中的 result 字段来"通过"自检（如把 ANALYZED_NOT_TESTED 改名为 ROLLBACK 但无实际测量数据）
+- quality-inspector 会交叉验证 results.json 中的数值与 layer4/ 目录下的 perf json 文件，造假将被直接 FAIL
 
 ### Step 4: 更新 state.json
 
