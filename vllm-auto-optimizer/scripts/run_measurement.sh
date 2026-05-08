@@ -66,23 +66,39 @@ if [[ "$PROFILING_MODE" -eq 1 ]]; then
 
     export _PROFILER_CONFIG="$PROFILER_CONFIG"
     export _MODIFIED_SERVE="$MODIFIED_SERVE"
-    python3 -c '
+    cat > /tmp/_inject_profiler_$$.py << 'PYEOF'
 import re, sys, os
 content = sys.stdin.read()
 profiler_config = os.environ["_PROFILER_CONFIG"]
 modified_serve = os.environ["_MODIFIED_SERVE"]
 if "--profiler-config" not in content:
-    # 只匹配非注释行的 vllm serve 命令（行首非 # 开头）
-    content = re.sub(
-        r"^([^#\n]*vllm\s+serve\s+.*?)(\s*$)",
-        r"\1 --profiler-config '"'"'" + profiler_config + "'"'"'" + r"\2",
-        content, count=1, flags=re.MULTILINE
-    )
+    lines = content.splitlines(keepends=True)
+    in_vllm = False
+    insert_idx = -1
+    for i, line in enumerate(lines):
+        stripped = line.rstrip()
+        if not in_vllm and re.search(r"vllm\s+serve\b", line) and not line.lstrip().startswith("#"):
+            in_vllm = True
+        if in_vllm:
+            if stripped.endswith("\\"):
+                insert_idx = i
+            else:
+                insert_idx = i
+                break
+    if insert_idx >= 0:
+        stripped = lines[insert_idx].rstrip()
+        if stripped.endswith("\\"):
+            lines[insert_idx] = stripped + " --profiler-config '" + profiler_config + "' \\\n"
+        else:
+            lines[insert_idx] = stripped + " --profiler-config '" + profiler_config + "'\n"
+        content = "".join(lines)
 if "DATA_SIMPLIFICATION" not in content:
     content = "export VLLM_PROFILER_DATA_SIMPLIFICATION=false\n" + content
 with open(modified_serve, "w") as f:
     f.write(content)
-' <<< "$SERVE_CONTENT"
+PYEOF
+    python3 /tmp/_inject_profiler_$$.py <<< "$SERVE_CONTENT"
+    rm -f /tmp/_inject_profiler_$$.py
     unset _PROFILER_CONFIG _MODIFIED_SERVE
 
     docker cp "$MODIFIED_SERVE" "$CONTAINER:$MODIFIED_SERVE"
@@ -145,6 +161,7 @@ _sync_serve_log() {
     [[ -n "$clog" ]] && docker cp "$CONTAINER:$clog" "$SERVE_LOG" 2>/dev/null || true
 }
 DECODE_STARTED=0
+SERVE_CRASHED=0
 for i in $(seq 1 60); do
     _sync_serve_log
     if grep -q "Avg generation throughput" "$SERVE_LOG" 2>/dev/null; then
@@ -152,9 +169,19 @@ for i in $(seq 1 60); do
         log_info "检测到 decoding 已开始 (serve 日志出现 Avg generation throughput)"
         break
     fi
+    # 每 15s 检测一次 serve 是否已 crash（EngineDeadError / 进程退出）
+    if [[ $((i % 3)) -eq 0 ]]; then
+        if grep -qE "EngineDeadError|EngineCore encountered an issue|APIServer.*Shutting down" "$SERVE_LOG" 2>/dev/null; then
+            SERVE_CRASHED=1
+            log_warn "检测到 serve 已 crash (EngineDeadError)，提前终止等待"
+            break
+        fi
+    fi
     sleep 5
 done
-if [[ "$DECODE_STARTED" -ne 1 ]]; then
+if [[ "$SERVE_CRASHED" -eq 1 ]]; then
+    log_warn "serve crash，跳过采集"
+elif [[ "$DECODE_STARTED" -ne 1 ]]; then
     log_warn "等待 300s 仍未检测到 decoding，继续采集"
 fi
 # 记录当前 serve 日志行数，后续只提取此行之后的 throughput
@@ -163,7 +190,11 @@ MEASURE_START=$(date +%s.%N)
 step_end
 
 # ========== Step 7: 采集（throughput / profiling） ==========
-if [[ "$PROFILING_MODE" -eq 1 ]]; then
+if [[ "$SERVE_CRASHED" -eq 1 ]]; then
+    step_start "Profiling 采集 (${DURATION}s)"
+    log_warn "serve 已 crash，跳过 profiling 采集"
+    step_end
+elif [[ "$PROFILING_MODE" -eq 1 ]]; then
     step_start "Profiling 采集 (${DURATION}s)"
     PROFILE_RESP=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST "http://localhost:$PORT/start_profile" 2>&1 || true)
     PROFILE_HTTP=$(echo "$PROFILE_RESP" | grep "HTTP_CODE:" | sed 's/HTTP_CODE://')
@@ -264,7 +295,12 @@ if [[ "$PROFILING_MODE" -eq 1 ]]; then
     step_start "离线解析 profiling（服务已停止）"
 
     # 11a. 查找 profiling 子目录（服务已停止，docker exec 安全）
+    # 优先查找注入的 profiling 目录，若为空则回退到 VLLM_TORCH_PROFILER_DIR（./vllm_profile 相对路径）
     FIRST_PROF=$(_docker_exec "find $PROFILER_CONTAINER_DIR -maxdepth 1 -name '*_ascend_pt' -type d | head -1" | tr -d '\r')
+    if [[ -z "$FIRST_PROF" ]]; then
+        VLLM_PROF_DIR=$(_docker_exec "find /tmp/vllm_profile /root/vllm_profile /home -maxdepth 4 -name '*_ascend_pt' -type d 2>/dev/null | head -1" | tr -d '\r')
+        [[ -n "$VLLM_PROF_DIR" ]] && FIRST_PROF="$VLLM_PROF_DIR" && PROFILER_CONTAINER_DIR=$(dirname "$VLLM_PROF_DIR")
+    fi
 
     if [[ -n "$FIRST_PROF" ]]; then
         # 11b. 离线解析（带重试）

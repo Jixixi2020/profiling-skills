@@ -1,7 +1,17 @@
 ---
 name: vllm-optimize-l1
 description: L1 默认优化项检测 subagent
-user_invocable: false
+user_invocable: true
+arguments:
+  - name: container
+    description: Docker 容器名
+    required: true
+  - name: base_dir
+    description: 输出根目录（宿主机路径），包含 state.json
+    required: true
+  - name: baseline_serve
+    description: 自定义基线 serve_script 路径（容器内）。不传则从 state.json 自动读取 Phase 0 基线
+    required: false
 ---
 
 # L1 默认优化项检测 Subagent
@@ -20,7 +30,29 @@ user_invocable: false
 3. 报告要求：每项测试必须记录 profiling 数据（before/after latency）、判定理由、serve 日志中的关键信息（如 crash 的错误信息）
 4. 对自己的工作质量负责，交付件会经过独立质量总监的严格审核
 
-本 skill 由 vllm-optimize-pm dispatch，不可直接调用。
+本 skill 可由 PM 自动 dispatch，也可作为独立 skill 直接调用。
+
+## 调用模式
+
+### 模式 1: PM dispatch（标准流程）
+PM 传入完整上下文参数（serve_script, benchmark_script, PORT, MODEL_NAME, profile_duration, proxy_duration, BEST_SERVE, state_json）。
+
+### 模式 2: 独立调用（调试/重跑）
+直接调用本 skill，只需传入 `container` 和 `base_dir`。其余参数从 `base_dir/state.json` 自动读取：
+
+```bash
+# 从 state.json 读取所有上下文
+BEST_SERVE=$(python3 $SKILL_BASE/../vllm-optimize-pm/scripts/layer_state.py get_baseline_for_layer $base_dir layer1)
+BENCHMARK_SCRIPT=$(python3 $SKILL_BASE/../vllm-optimize-pm/scripts/layer_state.py get $base_dir input.benchmark_script | tr -d '"')
+PORT=$(python3 $SKILL_BASE/../vllm-optimize-pm/scripts/layer_state.py get $base_dir input.port | tr -d '"')
+MODEL_NAME=$(python3 $SKILL_BASE/../vllm-optimize-pm/scripts/layer_state.py get $base_dir model_info.name | tr -d '"')
+# 若显式传入 baseline_serve，则用它覆盖 BEST_SERVE
+if [ -n "$baseline_serve" ]; then
+  BEST_SERVE="$baseline_serve"
+fi
+```
+
+**独立调用时**: state.json 必须已由 PM Phase 0 初始化（含 baseline 数据）。如果 state.json 不存在或不完整，先运行 PM Phase 0 或手动初始化。
 
 ## 不可违反的执行原则
 
@@ -30,13 +62,21 @@ user_invocable: false
 4. 保留阈值：收益 >= 1% 才保留（latency 降低 >=1% 或 throughput 提升 >=1%），<1% 视为测量噪声，不保留
 5. 完成后必须调用 /vllm-report-generator 生成阶段报告
 6. **禁止延迟**: to_test 列表中的每一项都必须实际测试或给出客观技术理由的 SKIP 判定，禁止以"延迟到 L2/L3"为由跳过。合法 SKIP 理由仅限：模型架构不匹配（如 MoE-only 项对 Dense 模型）、硬件不支持（如 A2 不支持某特性）、序列长度/TP 数不满足最低要求
+7. **批量优先**: 纯 env var 项（无 serve 参数变更、无冲突项）必须先合并为一批测试。批量结果持平则全批 ROLLBACK，不得逐项单独测试浪费服务启动时间
+8. **快速筛查先行**: 每项/每批先跑吞吐模式（无 --profiling），仅当吞吐有差异时再跑 profiling 离线解析。吞吐明显劣化可直接 ROLLBACK，省去 220s 解析时间
 
-## 输入（由 PM 传入）
+## 输入（由 PM 传入或从 state.json 自取）
 
+**必填（独立调用）：**
 - `container`: Docker 容器名
+- `base_dir`: 输出根目录（宿主机路径）
+
+**可选（独立调用）：**
+- `baseline_serve`: 自定义基线 serve_script（容器内路径）。不传则从 state.json 读取 Phase 0 的 `input.serve_script`
+
+**PM dispatch 时额外传入：**
 - `serve_script`: 容器内 serve 启动脚本路径
 - `benchmark_script`: 容器内 benchmark 脚本路径
-- `base_dir`: 输出根目录（宿主机路径）
 - `PORT`: 服务端口
 - `MODEL_NAME`: 模型名称
 - `profile_duration`: profiling 采集时长（秒）
@@ -153,62 +193,141 @@ python3 $SKILL_BASE/../vllm-auto-optimizer/scripts/latency_judge.py \
 
 后续遍历 to_test 时跳过所有 `special_handling` 项，避免重复测试。
 
-### Step 5: 逐项 profiling 测试（to_test 列表）
+### Step 5: 批量合并测试 + 快速筛查（优化策略）
 
-对 to_test 列表中每一项（跳过 special_handling 项），编号 N 从 1 开始:
+> **设计目标**: 避免逐项重启服务（每项~12分钟）。to_test 中大部分是纯 env var 项，合并后一次服务启动即可覆盖。仅在必要时才进行 profiling 离线解析（省 220s/项）。
 
-#### 5a. 生成临时 serve_script
+对 to_test 列表中每一项（跳过 special_handling 项，它们已由 Step 4 处理）:
+
+#### 5a. 分类 to_test 项
+
+根据 check_result.json 中各 item 的属性分类:
+
+| 类别 | 判定条件 | 策略 |
+|------|----------|------|
+| **batchable** | `conflicts_with` 为空 AND `test_config` 不含 `--` 开头的 serve 参数（纯 env var） | 合并为一批，一次测量 |
+| **individual** | `conflicts_with` 非空 OR `test_config` 包含 serve 参数变更 | 单独测试 |
+
+```bash
+# 用 python3 分类并输出
+python3 -c "
+import json
+with open('$base_dir/layer1/check_result.json') as f:
+    data = json.load(f)
+batchable = []
+individual = []
+for item in data.get('to_test', []):
+    if item.get('special_handling'):
+        continue  # 已由 Step 4 处理
+    tc = item.get('test_config', '')
+    cf = item.get('conflicts_with', [])
+    if not cf and not any(s.startswith('--') for s in tc.split('\n') if s.strip()):
+        batchable.append(item)
+    else:
+        individual.append(item)
+print(f'BATCHABLE ({len(batchable)}):', ','.join(i['id'] for i in batchable))
+print(f'INDIVIDUAL ({len(individual)}):', ','.join(i['id'] for i in individual))
+# 保存分类结果
+with open('$base_dir/layer1/batch_classification.json', 'w') as f:
+    json.dump({'batchable': batchable, 'individual': individual}, f, indent=2)
+"
+```
+
+#### 5b. 批量合并测试（batchable 项 > 0 时执行）
+
+将所有 batchable 项的 env var 合并到一个 serve script，**使用吞吐模式（无 --profiling，省 220s 离线解析）**:
+
+```bash
+# 生成合并后的 serve script（所有 batchable 项的 test_config 合并）
+BATCH_IDS=$(python3 -c "import json; d=json.load(open('$base_dir/layer1/batch_classification.json')); print(','.join(i['id'] for i in d['batchable']))")
+
+python3 $SKILL_BASE/../vllm-optimize-pm/scripts/gen_serve_script.py --base $PREV_BEST_SERVE \
+  --apply-json $base_dir/layer1/check_result.json --pick-ids $BATCH_IDS \
+  -o $base_dir/layer1/test_batch_serve.sh
+
+# run_in_background=true — 吞吐模式，无需 --profiling
+bash $SKILL_BASE/../vllm-auto-optimizer/scripts/run_measurement.sh \
+  $container $base_dir/layer1/test_batch_serve.sh $PORT "single $MODEL_NAME" $profile_duration \
+  $base_dir/layer1/test_batch_perf.json $base_dir/layer1/test_batch_serve.log
+```
+
+**批量结果判定**（基于 serve log 中提取的 avg_tps）:
+
+```bash
+# 比较 batch perf vs baseline（用 throughput_judge 比较 avg_tps）
+# run_in_background=true — 先测 baseline throughput
+bash $SKILL_BASE/../vllm-auto-optimizer/scripts/run_measurement.sh \
+  $container $PREV_BEST_SERVE $PORT "script $benchmark_script" $proxy_duration \
+  $base_dir/layer1/test_batch_baseline_tput.json $base_dir/layer1/test_batch_baseline_tput_serve.log
+
+# 再测 batch throughput
+bash $SKILL_BASE/../vllm-auto-optimizer/scripts/run_measurement.sh \
+  $container $base_dir/layer1/test_batch_serve.sh $PORT "script $benchmark_script" $proxy_duration \
+  $base_dir/layer1/test_batch_tput.json $base_dir/layer1/test_batch_tput_serve.log
+
+python3 $SKILL_BASE/../vllm-auto-optimizer/scripts/throughput_judge.py \
+  $base_dir/layer1/test_batch_baseline_tput.json $base_dir/layer1/test_batch_tput.json
+```
+
+| 批量结果 | 处理方式 |
+|----------|----------|
+| throughput 变化 ≤1%（持平） | **全批 ROLLBACK** — 所有 batchable 项一次性标记为 ROLLBACK，无需逐项测试 |
+| throughput 劣化 >1% | 进入二分搜索（5b-二分），找出退化项 |
+| throughput 提升 >1% | 全批 KEEP + 逐项 profiling 确认收益来源 |
+
+**5b-二分搜索**（仅当批量结果劣化 >1%）:
+
+将 batchable 列表对半分成两组，分别生成 serve script 并测试（吞吐模式，无 profiling），递归缩小范围直到定位到具体的退化项。
+
+**5b-逐项确认**（仅当批量结果提升 >1%）:
+
+对每个 batchable 项进行单独 profiling 测试（同 Step 5d），确认具体哪项有收益。
+
+#### 5c. 处理 individual 项（保持独立测试）
+
+对 individual 列表中的每一项:
 
 ```bash
 python3 $SKILL_BASE/../vllm-optimize-pm/scripts/gen_serve_script.py --base $PREV_BEST_SERVE \
   --apply-json $base_dir/layer1/check_result.json --pick-ids $ITEM_ID \
-  -o $base_dir/layer1/test_N_serve.sh
-TEMP_SERVE=$base_dir/layer1/test_N_serve.sh
+  -o $base_dir/layer1/test_I_serve.sh
 ```
 
-#### 5b. 运行测量
+**快速筛查**: 先跑吞吐模式（无 profiling），仅在 throughput 有差异时再跑 profiling:
 
 ```bash
-# run_in_background=true
+# 第一步：吞吐快速筛查（无 --profiling）
 bash $SKILL_BASE/../vllm-auto-optimizer/scripts/run_measurement.sh \
-  $container $TEMP_SERVE $PORT "single $MODEL_NAME" $profile_duration \
-  $base_dir/layer1/test_N_perf.json $base_dir/layer1/test_N_serve.log \
-  --profiling $base_dir/layer1/test_N_profiling
+  $container $base_dir/layer1/test_I_serve.sh $PORT "single $MODEL_NAME" $profile_duration \
+  $base_dir/layer1/test_I_perf.json $base_dir/layer1/test_I_serve.log
 ```
 
-#### 5c. 效果判断
+从 perf.json 提取 avg_tps，与 baseline 比较:
+- avg_tps 劣化 >1% → **SKIP profiling，直接 ROLLBACK**（省 220s）
+- avg_tps 持平或改善 → 进入第二步 profiling 确认
+
+```bash
+# 第二步：profiling 精确测量（仅当快速筛查通过时）
+bash $SKILL_BASE/../vllm-auto-optimizer/scripts/run_measurement.sh \
+  $container $base_dir/layer1/test_I_serve.sh $PORT "single $MODEL_NAME" $profile_duration \
+  $base_dir/layer1/test_I_profiling_perf.json $base_dir/layer1/test_I_profiling_serve.log \
+  --profiling $base_dir/layer1/test_I_profiling
+```
+
+#### 5d. 效果判断（同原 5c/5d）
 
 ```bash
 python3 $SKILL_BASE/../vllm-auto-optimizer/scripts/latency_judge.py \
-  $PREV_PERF $base_dir/layer1/test_N_perf.json
+  $PREV_PERF $base_dir/layer1/test_I_profiling_perf.json
 ```
 
-#### 5d. Latency 提取失败 Fallback
-
-如果 latency_judge 返回 `metric="latency_failed"`，fallback 到 throughput 重测:
-
-```bash
-# 重测 baseline（如果尚未有 throughput baseline）
-# run_in_background=true
-bash $SKILL_BASE/../vllm-auto-optimizer/scripts/run_measurement.sh \
-  $container $PREV_BEST_SERVE $PORT "script $benchmark_script" $proxy_duration \
-  $base_dir/layer1/test_N_baseline_tput_perf.json $base_dir/layer1/test_N_baseline_tput_serve.log
-
-# 重测当前配置
-# run_in_background=true
-bash $SKILL_BASE/../vllm-auto-optimizer/scripts/run_measurement.sh \
-  $container $TEMP_SERVE $PORT "script $benchmark_script" $proxy_duration \
-  $base_dir/layer1/test_N_tput_perf.json $base_dir/layer1/test_N_tput_serve.log
-
-# 用 avg_tps 判断
-python3 $SKILL_BASE/../vllm-auto-optimizer/scripts/throughput_judge.py \
-  $base_dir/layer1/test_N_baseline_tput_perf.json $base_dir/layer1/test_N_tput_perf.json
-```
+Latency 提取失败时 fallback 到 throughput 判断（同原 5d 逻辑）。
 
 #### 5e. 结果处理
 
 - KEEP: 更新 `PREV_BEST_SERVE=$TEMP_SERVE`，`PREV_PERF=test_N_perf.json`，记录到 kept_opts
 - ROLLBACK: 不更新，继续下一项
+- SKIP: 记录 skip 原因（crash/不兼容），继续下一项
 
 ### Step 6: 更新 state.json
 

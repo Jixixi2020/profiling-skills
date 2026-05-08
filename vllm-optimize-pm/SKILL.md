@@ -41,6 +41,16 @@ arguments:
     description: Layer3 最大参数组合数
     required: false
     default: "30"
+  - name: mode
+    description: "运行模式: init（仅初始化，跑完 Phase 0 即停）、full（完整流程）、single（只跑一层）、resume（从第一个未完成的层继续）"
+    required: false
+    default: full
+  - name: layer
+    description: "当 mode=single 时，指定要运行的层: L1/L2/L3/L4/L5"
+    required: false
+  - name: baseline_serve
+    description: "自定义基线 serve_script（容器内路径），仅在 mode=single 时生效，传给目标层作为基线"
+    required: false
 ---
 
 # vLLM 推理自动调优 PM — 四层递进式优化编排
@@ -111,6 +121,86 @@ proxy_duration=${proxy_duration:-100}
 max_combinations=${max_combinations:-30}
 ```
 从 ARGUMENTS 中提取用户显式传入的值覆盖默认值。后续所有步骤中出现的 `$profile_duration`、`$proxy_duration` 等变量均引用此处的值，不得自行填写数字。
+
+---
+## 运行模式
+
+PM 支持三种运行模式，通过 `mode` 参数切换。
+
+### 模式 1: `init`（仅初始化，快速启动）
+
+只执行 Phase 0 全部步骤（环境校验、Git 初始化、配置扫描、基线测量、state.json 初始化），完成后即退出，不 dispatch 任何 subagent。
+
+```
+/vllm-optimize-pm mode=init serve_script=... benchmark_script=... container=... base_dir=... hardware_type=A2
+```
+
+**适用场景：**
+- 首次使用，先初始化环境再决定从哪层开始调
+- state.json 丢失或损坏，需要重新初始化
+- 基线数据过期，需要重新测量
+
+完成后 `state.json` 已就绪，即可独立调用任意层：
+```
+/vllm-optimize-l1 container=... base_dir=...
+/vllm-optimize-l2 container=... base_dir=...
+```
+
+### 模式 2: `full`（默认，完整流程）
+
+按 Phase 0 → L1 → L2 → L3 → L4 → L5 → 收尾 顺序执行。行为与原有设计完全一致。
+
+### 模式 3: `single`（单层调试）
+
+只运行指定的一层，需配合 `layer` 参数使用。
+
+```
+/vllm-optimize-pm mode=single layer=L3 [baseline_serve=/path/to/custom.sh]
+```
+
+**执行逻辑：**
+
+1. 检查 state.json 是否存在。若不存在，自动执行 Phase 0 初始化（仅环境校验 + 基线测量）
+2. 读取 `layer_state.py get_baseline_for_layer` 获取目标层基线
+3. 若用户传入 `baseline_serve`，用它覆盖基线
+4. Dispatch 目标层 subagent，传递 baseline_serve
+5. 完成后：`mark_stale $base_dir <current_layer>` 标记后续层为 stale
+6. 不执行 quality-inspector 验收（单层调试场景，验收由用户自行判断）
+
+**适用场景：**
+- 调试某层的优化逻辑（不需要重跑前置层）
+- L1 已 KEEP 的优化项不变，只想重新搜索 L2 的配置项
+- 以任意自定义 serve 脚本为基线，快速验证某一层的优化效果
+
+### 模式 4: `resume`（断点续传）
+
+从第一个 status != "completed" 的层开始，继续执行后续所有层。
+
+```
+/vllm-optimize-pm mode=resume
+```
+
+**执行逻辑：**
+
+1. 读取 state.json，遍历 L1-L5 的 status
+2. 找到第一个 status 不是 "completed" 的层
+3. 从该层开始，按 `full` 模式继续执行（含 quality-inspector 验收）
+4. 如果所有层都是 completed，输出 "All layers already completed" 并跳过
+
+**适用场景：**
+- subagent 进程异常终止后的恢复
+- quality-inspector 返工后的重新验收
+- 用户手动修复了某层的问题后继续
+
+### stale 状态说明
+
+当某层被独立重跑后（mode=single），后续层会被标记为 `stale`。这表示：
+- 后续层的优化是在"旧的"当前最优配置上完成的
+- 现在前置层产生了新的最优配置，后续层需要重新验证
+
+stale 不等于 failed。用户可以选择：
+- 在后续调试中重新跑 stale 层（mode=single layer=那个层）
+- 或使用 mode=resume 从第一个 stale 层开始重新执行
 
 ---
 ## Phase 0: 初始化流程
@@ -222,7 +312,7 @@ python3 $SKILL_BASE/scripts/layer_state.py set $base_dir baseline.latency_us $LA
 ---
 ## Subagent 调度协议
 
-PM 依次 dispatch L1 → L2 → L3 → L4 四个 subagent，每个使用 Agent tool 启动。subagent 之间通过 `$base_dir/state.json` 和 `$base_dir/layerN/results.json` 传递状态。
+PM 依次 dispatch L1 → L2 → L3 → L4 → L5 五个 subagent，每个使用 Agent tool 启动。subagent 之间通过 `$base_dir/state.json` 和 `$base_dir/layerN/results.json` 传递状态。
 
 ### 调度顺序
 
@@ -248,9 +338,39 @@ L5: vllm-optimize-l5
   ↓ dispatch quality-inspector 最终验收
 ```
 
+**L5 强制调度规则：** L5 必须始终 dispatch，即使 L1-L4 全部 KEEP=0。L5 的职责不仅是汇总成功项，还包括：
+- 记录所有 KEEP/ROLLBACK/SKIP 的完整测试情况
+- 生成端到端完成时间实验数据
+- 绘制 progression 折线图（即使曲线是平的）
+- 分析所有层均无收益的原因
+- 给出完整的优化结论和后续建议
+
+禁止在 L4 QI PASS 后直接跳入收尾而跳过 L5 dispatch。
+
+### 模式感知调度
+
+PM 根据 `mode` 参数决定实际调度行为：
+
+**init 模式**: 执行 Phase 0 全部步骤 → 输出 "state.json initialized, ready for independent layer calls" → 退出。不 dispatch 任何 subagent。
+
+**full 模式**: 检查 state.json → 若不存在则先执行 Phase 0 → 按上述顺序依次 dispatch L1-L5 → 收尾。
+
+**single 模式**:
+1. 检查 state.json 是否存在。若不存在，自动执行 Phase 0 初始化
+2. 获取基线：`python3 $SKILL_BASE/scripts/layer_state.py get_baseline_for_layer $base_dir <layer>`
+3. 若用户传入 `baseline_serve`，覆盖基线
+4. Dispatch 目标层，额外传入 `baseline_serve`
+5. 完成后执行：`python3 $SKILL_BASE/scripts/layer_state.py mark_stale $base_dir <layer>`
+
+**resume 模式**:
+1. 读取 state.json，找到第一个 status != "completed" 的层
+2. 检查 stale 层：如果存在 status="stale" 的层，从第一个 stale 层开始
+3. 从该层开始按 full 模式继续执行
+4. 如果所有层都是 completed，输出摘要并退出
+
 ### Dispatch 模板
 
-每个 subagent 通过 Agent tool 启动，传递以下上下文：
+**通用上下文（所有层共享）：**
 
 ```
 使用 Agent tool 启动 subagent，prompt 包含:
@@ -267,6 +387,13 @@ L5: vllm-optimize-l5
 - 交付件输出路径: $base_dir/final_deliverables/layer{N}/（报告和图表）
 - 工作目录: $base_dir/layer{N}/（results.json、profiling 等中间文件）
 - 配置项 CSV 路径: $SKILL_BASE/../vllm-config-scanner/data/all_configs.csv（L2/L3 使用，不存在时 L2/L3 会自动触发扫描）
+```
+
+**single 模式附加上下文：**
+```
+- 独立调用模式，直接传入 baseline_serve（如果用户提供了）
+- 若 baseline_serve 已传入 → 子 skill 跳过衔接验证
+- 若前置层 results.json 不存在 → 子 skill 跳过依赖前置层的排除逻辑
 ```
 
 L5 dispatch 额外参数:
@@ -394,6 +521,7 @@ quality-inspector 是独立第三方质量审计员，通过 Agent tool dispatch
 - [ ] 报告体现了源码分析过程（有具体的代码路径、函数名、行号引用）
 - [ ] 实验数据完整（每项优化有 before/after 数据、判定依据）
 - [ ] 决策思考过程清晰（为什么选择这个优化方向、为什么 KEEP/ROLLBACK）
+- [ ] 图表目录非空（`$base_dir/final_deliverables/layer{N}/charts/` 至少包含 1 个 .png 文件）
 
 #### 三、工作态度
 
@@ -401,6 +529,8 @@ quality-inspector 是独立第三方质量审计员，通过 Agent tool dispatch
 - [ ] 未将本层应做的工作推给下一层
 - [ ] L2/L3 执行了知识库全量检索（case_search_results 非空）
 - [ ] L2/L3 执行了配置项 CSV 搜索 TOP-5（config_search_results 非空）
+- [ ] **L3 专项**：`config_search_results` 中的推荐项必须全部测试（action="test"），不得标记为 `action="not_tested"`。合法的 not_applicable 项必须有客观技术理由记录
+- [ ] **L4 专项**：每项优化必须执行完整的 apply → measure → judge，`results.json` 中不得出现 `"result": "ANALYZED_NOT_TESTED"`。所有 5 项 tested_items_detail 的 result 必须为 KEEP 或 ROLLBACK
 - [ ] L4 每项优化具有原创性（不在 optimization_items.py 已有配置项中，不在 case_files/ 已有案例中）
 
 #### 四、衔接一致性（L2/L3/L4/L5 验收时检查）
@@ -420,7 +550,11 @@ quality-inspector 是独立第三方质量审计员，通过 Agent tool dispatch
 - [ ] `$base_dir/final_deliverables/timeline_comparison.png` 存在
 - [ ] `$base_dir/final_deliverables/patches/final.patch` 存在
 - [ ] `$base_dir/final_deliverables/patches/SUMMARY.md` 存在
-- [ ] `$base_dir/final_deliverables/pm_execution_log.md` 内容完整（覆盖全流程）
+- [ ] `$base_dir/final_deliverables/pm_execution_log.md` 内容完整（覆盖全流程，含 L5）
+- [ ] `$base_dir/layer5/results.json` 存在（L5 已执行）
+- [ ] `$base_dir/final_deliverables/layer5/layer5_report.md` 存在
+- [ ] `$base_dir/final_deliverables/layer5/charts/` 至少包含 3 个 .png 文件
+- [ ] `state.json` 中 `current_best.cumulative_opts` 包含所有 KEEP 项（含 forced 项），不为空数组
 - [ ] 容器内源码已还原（git status clean）
 
 ### PM 处理 quality-inspector 报告的流程
@@ -513,13 +647,13 @@ PM 在以下时机必须向用户输出进度汇报（同时写入 $base_dir/fin
 ---
 ## 收尾流程（Checklist 驱动）
 
-所有 4 个 Layer 通过 quality-inspector 验收后，PM 按以下 checklist 逐步执行收尾。每步完成后记录到执行日志。
+所有 5 个 Layer (L1-L5) 通过 quality-inspector 验收后，PM 按以下 checklist 逐步执行收尾。每步完成后记录到执行日志。
 
 | 步骤 | step_key | 描述 | 完成标志 |
 |------|----------|------|----------|
 | 1 | final_measurement | 最终 throughput 测量 | final_perf.json 存在且 avg_tps > 0 |
 | 2 | report_generation | 调用 vllm-report-generator | FINAL_REPORT.md + 2 个 .png |
-| 3 | patch_generation | 生成结构化 patches | patches/final.patch + SUMMARY.md |
+| 3 | patch_generation | 生成结构化 patches（含 forced 项） | patches/final.patch + SUMMARY.md |
 | 3.3 | case_file_copy | 复制 L4 案例文件到知识库 | case_files 已复制或目录为空 |
 | 3.5 | source_restore | 还原容器内源码 | git status clean |
 | 4 | quality_inspection | dispatch quality-inspector 收尾验收 | verdict == PASS |
@@ -553,11 +687,15 @@ bash $SKILL_BASE/../vllm-auto-optimizer/scripts/run_measurement.sh \
 
 ### 步骤 3: 生成结构化 patches 输出
 
+**配置 patches：** 从 `state.json` 的 `current_best.cumulative_opts` 提取所有 KEEP 项（含 forced 项），为每一项配置优化生成 `config/XX_<name>/config.sh` 和 `README.md`。Forced 项（L1 默认优化）必须包含在内。
+
+**代码 patches：** 从容器内 git diff 提取代码修改，按优化项拆分为独立 patch 文件。
+
 ```bash
 bash $SKILL_BASE/scripts/generate_patch.sh $container $vllm_src $vllm_ascend_src $base_dir/final_deliverables/patches/final.patch
 ```
 
-然后按照 Patches 输出结构（见下文）组织目录。
+然后按照 Patches 输出结构（见下文）组织目录。如果 `cumulative_opts` 为空且无代码修改，记录原因到执行日志；不得跳过此步骤。
 
 ### 步骤 3.3: 复制案例文件到知识库
 

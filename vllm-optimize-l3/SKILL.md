@@ -1,7 +1,17 @@
 ---
 name: vllm-optimize-l3
 description: L3 调度吞吐优化 subagent
-user_invocable: false
+user_invocable: true
+arguments:
+  - name: container
+    description: Docker 容器名
+    required: true
+  - name: base_dir
+    description: 输出根目录（宿主机路径），包含 state.json
+    required: true
+  - name: baseline_serve
+    description: 自定义基线 serve_script 路径（容器内）。不传则从 state.json 自动读取 current_best.serve_script
+    required: false
 ---
 
 # L3 调度吞吐优化 Subagent
@@ -21,7 +31,28 @@ user_invocable: false
 4. 鼓励做困难的、深入的优化：涉及代码修改的优化项只要有潜力就应积极尝试
 5. 对自己的工作质量负责，交付件会经过独立质量总监的严格审核
 
-本 skill 由 vllm-optimize-pm dispatch，不可直接调用。
+本 skill 可由 PM 自动 dispatch，也可作为独立 skill 直接调用。
+
+## 调用模式
+
+### 模式 1: PM dispatch（标准流程）
+PM 传入完整上下文参数。
+
+### 模式 2: 独立调用（调试/重跑）
+直接调用本 skill，只需传入 `container` 和 `base_dir`。其余参数从 `base_dir/state.json` 自动读取：
+
+```bash
+BEST_SERVE=$(python3 $SKILL_BASE/../vllm-optimize-pm/scripts/layer_state.py get_baseline_for_layer $base_dir layer3)
+# 若显式传入 baseline_serve，则用它覆盖
+if [ -n "$baseline_serve" ]; then
+  BEST_SERVE="$baseline_serve"
+fi
+```
+
+**独立调用时**：
+- state.json 必须已存在且 `current_best.serve_script` 有效
+- 如果 L1/L2 的 `results.json` 不存在，跳过"排除 L1/L2 已测试项"步骤
+- 衔接验证：若显式传入 `baseline_serve`，跳过偏差检查。若从 state.json 读取基线，则正常做偏差检查
 
 ## 不可违反的执行原则
 
@@ -30,9 +61,17 @@ user_invocable: false
 3. 每个测试步骤完成后自动进入下一步，禁止停顿询问
 4. 完成后必须调用 /vllm-report-generator 生成阶段报告
 
-## 输入（由 PM 传入）
+## 输入（由 PM 传入或从 state.json 自取）
 
-- `container`, `serve_script`, `benchmark_script`, `base_dir`, `PORT`, `MODEL_NAME`
+**必填（独立调用）：**
+- `container`: Docker 容器名
+- `base_dir`: 输出根目录（宿主机路径），包含 state.json
+
+**可选（独立调用）：**
+- `baseline_serve`: 自定义基线 serve_script（容器内路径）。不传则从 state.json 读取 `current_best.serve_script`
+
+**PM dispatch 时额外传入 / 从 state.json 自取：**
+- `serve_script`, `benchmark_script`, `PORT`, `MODEL_NAME`
 - `profile_duration`, `proxy_duration`, `max_combinations`
 - `vllm_src`, `vllm_ascend_src`
 - `state_json`: state.json 路径
@@ -51,16 +90,26 @@ user_invocable: false
 
 ## 执行流程
 
-### Step 0: 继承 L2 最优配置
+### Step 0: 确定基线配置
 
-**衔接验证**（必须在任何优化测试之前执行）:
-1. 使用 L2 输出的 best_serve.sh 运行单请求 profiling
+**基线优先级:**
+1. 若传入 `baseline_serve` 参数 → 直接使用（跳过衔接验证）
+2. 否则从 state.json 读取 `current_best.serve_script`（即 L2 最优输出）
+
+**衔接验证**（仅在未显式传入 baseline_serve 时执行）:
+1. 使用 `current_best.serve_script` 运行单请求 profiling
 2. 提取 decode_step_latency_us，与 L2 交付的数值对比
 3. 偏差 < 3% → 继续；偏差 >= 3% → 停止并上报 PM
-4. 本 Layer 所有优化在 L2 最优配置基础上叠加
+4. 本 Layer 所有优化在当前最优配置基础上叠加
 
 ```bash
-BEST_SERVE=$(python3 $SKILL_BASE/../vllm-optimize-pm/scripts/layer_state.py get $base_dir current_best.serve_script | tr -d '"')
+# 确定基线
+if [ -n "$baseline_serve" ]; then
+  BEST_SERVE="$baseline_serve"
+  SKIP_VERIFY=true
+else
+  BEST_SERVE=$(python3 $SKILL_BASE/../vllm-optimize-pm/scripts/layer_state.py get $base_dir current_best.serve_script | tr -d '"')
+fi
 BEST_TPS=$(python3 $SKILL_BASE/../vllm-optimize-pm/scripts/layer_state.py get $base_dir current_best.throughput_tps)
 ```
 
@@ -214,6 +263,18 @@ docker exec $container bash --norc --noprofile -c "cat $benchmark_script" | \
 ```
 
 检查输出中 num_requests / input_len / output_len 是否为 null。任一为 null 则向 PM 报告需要用户补充信息。
+
+**单请求 benchmark 处理规则：**
+
+如果解析出 `num_requests == 1`（单请求 benchmark），模块 C（调度参数搜索）可标记为 not_applicable 并记录原因，但 **模块 A（配置测试）和模块 B（代码优化）必须照常执行，不可跳过**。具体规则：
+
+| 模块 | num_requests==1 时 | 说明 |
+|------|-------------------|------|
+| A: 配置测试 | **必须执行** | A3 逐项测试 TOP-10 配置项，使用 benchmark 脚本测量 throughput |
+| B: 代码优化 | **必须执行** | B2 案例代码修改测试 |
+| C: 调度搜索 | 可跳过 | C2/C3 标记 not_applicable，记录 `"reason": "num_prompts=1, scheduling parameters have no concurrent load to optimize"` |
+
+**禁止**以"单请求 benchmark 无法体现调度优化效果"为由跳过模块 A 和 B。`config_search_results` 中 5 项 TOP-N 推荐必须全部测试（action="test"），不允许标记为 `action="not_tested"` 而不做测试。
 
 #### C2. 计算调度参数网格
 

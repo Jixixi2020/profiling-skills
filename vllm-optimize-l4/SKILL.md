@@ -1,7 +1,17 @@
 ---
 name: vllm-optimize-l4
 description: L4 深度原创优化 subagent
-user_invocable: false
+user_invocable: true
+arguments:
+  - name: container
+    description: Docker 容器名
+    required: true
+  - name: base_dir
+    description: 输出根目录（宿主机路径），包含 state.json
+    required: true
+  - name: baseline_serve
+    description: 自定义基线 serve_script 路径（容器内）。不传则从 state.json 自动读取 current_best.serve_script
+    required: false
 ---
 
 # L4 深度原创优化 Subagent
@@ -31,9 +41,40 @@ user_invocable: false
   3) 基于当前模型的 profiling timeline 和源码分析独立得出
 即使前 N 项全部 ROLLBACK，仍必须继续尝试到第 5 项。
 不满 5 项不得标记 L4 为 completed。
+
+每项优化必须执行完整的 apply → measure → judge 流程:
+  1) apply: 在容器内应用代码修改 (apply_code_fix.sh)
+  2) measure: 运行 run_measurement.sh 采集性能数据
+  3) judge: 使用 latency_judge.py 或 throughput_judge.py 判定 KEEP/ROLLBACK
+
+禁止行为:
+  - 禁止将优化项标记为 "ANALYZED_NOT_TESTED"（分析但未测试）。这是变相 SKIP，不计入 original_code_fixes
+  - 禁止以"测量精度不足"或"预期收益低于测量阈值"为由跳过测试
+  - 如果测量精度确实限制判定（如 latency 恒定值），仍必须执行 apply → measure → judge，
+    将测量结果如实记录，判定为 ROLLBACK，并在 reason 中说明测量精度限制
 ```
 
-本 skill 由 vllm-optimize-pm dispatch，不可直接调用。
+本 skill 可由 PM 自动 dispatch，也可作为独立 skill 直接调用。
+
+## 调用模式
+
+### 模式 1: PM dispatch（标准流程）
+PM 传入完整上下文参数。
+
+### 模式 2: 独立调用（调试/重跑）
+直接调用本 skill，只需传入 `container` 和 `base_dir`。其余参数从 `base_dir/state.json` 自动读取：
+
+```bash
+BEST_SERVE=$(python3 $SKILL_BASE/../vllm-optimize-pm/scripts/layer_state.py get_baseline_for_layer $base_dir layer4)
+# 若显式传入 baseline_serve，则用它覆盖
+if [ -n "$baseline_serve" ]; then
+  BEST_SERVE="$baseline_serve"
+fi
+```
+
+**独立调用时**：
+- state.json 必须已存在且 `current_best.serve_script` 有效
+- 衔接验证：若显式传入 `baseline_serve`，跳过偏差检查。若从 state.json 读取基线，则正常做偏差检查
 
 ## 不可违反的执行原则
 
@@ -43,9 +84,17 @@ user_invocable: false
 4. 必须完成至少 5 项原创代码优化的完整 apply -> measure -> judge 流程
 5. 完成后必须调用 /vllm-report-generator 生成阶段报告
 
-## 输入（由 PM 传入）
+## 输入（由 PM 传入或从 state.json 自取）
 
-- `container`, `serve_script`, `benchmark_script`, `base_dir`, `PORT`, `MODEL_NAME`
+**必填（独立调用）：**
+- `container`: Docker 容器名
+- `base_dir`: 输出根目录（宿主机路径），包含 state.json
+
+**可选（独立调用）：**
+- `baseline_serve`: 自定义基线 serve_script（容器内路径）。不传则从 state.json 读取 `current_best.serve_script`
+
+**PM dispatch 时额外传入 / 从 state.json 自取：**
+- `serve_script`, `benchmark_script`, `PORT`, `MODEL_NAME`
 - `profile_duration`, `proxy_duration`
 - `vllm_src`, `vllm_ascend_src`
 - `state_json`: state.json 路径
@@ -64,16 +113,26 @@ user_invocable: false
 
 ## 执行流程
 
-### Step 0: 继承 L3 最优配置
+### Step 0: 确定基线配置
 
-**衔接验证**（必须在任何优化测试之前执行）:
-1. 使用 L3 输出的 best_serve.sh 运行单请求 profiling
+**基线优先级:**
+1. 若传入 `baseline_serve` 参数 → 直接使用（跳过衔接验证）
+2. 否则从 state.json 读取 `current_best.serve_script`（即 L3 最优输出）
+
+**衔接验证**（仅在未显式传入 baseline_serve 时执行）:
+1. 使用 `current_best.serve_script` 运行单请求 profiling
 2. 提取 decode_step_latency_us，与 L3 交付的数值对比
 3. 偏差 < 3% → 继续；偏差 >= 3% → 停止并上报 PM
-4. 本 Layer 所有优化在 L3 最优配置基础上叠加
+4. 本 Layer 所有优化在当前最优配置基础上叠加
 
 ```bash
-BEST_SERVE=$(python3 $SKILL_BASE/../vllm-optimize-pm/scripts/layer_state.py get $base_dir current_best.serve_script | tr -d '"')
+# 确定基线
+if [ -n "$baseline_serve" ]; then
+  BEST_SERVE="$baseline_serve"
+  SKIP_VERIFY=true
+else
+  BEST_SERVE=$(python3 $SKILL_BASE/../vllm-optimize-pm/scripts/layer_state.py get $base_dir current_best.serve_script | tr -d '"')
+fi
 BEST_TPS=$(python3 $SKILL_BASE/../vllm-optimize-pm/scripts/layer_state.py get $base_dir current_best.throughput_tps)
 ```
 

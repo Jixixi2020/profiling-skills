@@ -10,6 +10,8 @@
   python3 layer_state.py update_best <base_dir> <serve_script> <tps> <opts_json> [duration]
   python3 layer_state.py set <base_dir> <json_path> <value>
   python3 layer_state.py get <base_dir> [json_path]
+  python3 layer_state.py get_baseline_for_layer <base_dir> <layer>
+  python3 layer_state.py mark_stale <base_dir> <from_layer>
   python3 layer_state.py dump <base_dir>
 """
 import json, os, sys, copy
@@ -125,6 +127,33 @@ def cmd_get(base_dir, json_path=None):
                 state = state[int(key)]
     print(json.dumps(state, ensure_ascii=False, indent=2))
 
+def cmd_get_baseline_for_layer(base_dir, layer):
+    """返回指定 layer 应使用的基线 serve_script。
+    L1 -> input.serve_script（Phase 0 原始基线）
+    L2/L3/L4/L5 -> current_best.serve_script（累积最优）"""
+    state = _load(base_dir)
+    if layer == "layer1":
+        baseline = state.get("input", {}).get("serve_script", "")
+    else:
+        baseline = state.get("current_best", {}).get("serve_script", "")
+    print(baseline)
+
+def cmd_mark_stale(base_dir, from_layer):
+    """将 from_layer 之后所有 layer 的状态标记为 stale。"""
+    state = _load(base_dir)
+    layer_order = ["layer1", "layer2", "layer3", "layer4", "layer5"]
+    try:
+        idx = layer_order.index(from_layer)
+    except ValueError:
+        print(json.dumps({"error": f"unknown layer: {from_layer}"})); sys.exit(1)
+    stale_layers = []
+    for l in layer_order[idx + 1:]:
+        if l in state.get("layers", {}):
+            state["layers"][l]["status"] = "stale"
+            stale_layers.append(l)
+    _save(base_dir, state)
+    print(json.dumps({"ok": True, "stale_layers": stale_layers}))
+
 def cmd_dump(base_dir):
     state = _load(base_dir)
     print(json.dumps(state, ensure_ascii=False, indent=2))
@@ -132,7 +161,9 @@ def cmd_dump(base_dir):
 if __name__ == "__main__":
     cmds = {"init": cmd_init, "set_baseline": cmd_set_baseline, "set_model_info": cmd_set_model_info,
             "update_layer": cmd_update_layer, "set_layer_status": cmd_set_layer_status,
-            "update_best": cmd_update_best, "set": cmd_set, "get": cmd_get, "dump": cmd_dump}
+            "update_best": cmd_update_best, "set": cmd_set, "get": cmd_get,
+            "get_baseline_for_layer": cmd_get_baseline_for_layer, "mark_stale": cmd_mark_stale,
+            "dump": cmd_dump}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         print(__doc__); sys.exit(1)
     cmd = sys.argv[1]
