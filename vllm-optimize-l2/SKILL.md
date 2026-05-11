@@ -141,6 +141,12 @@ vllm-config-scanner skill（通过 Skill tool）来生成 CSV，然后继续搜�
 每项推荐记录：item_id、name、category、relevance_reason（与当前瓶颈的关联分析）、action（test）
 
 对推荐的 TOP-5 项，在模块 A 的 A4 步骤中逐项测试。
+
+**not_tested 规则（2026-05-11 新增）**：任何 `action="not_tested"` 的项必须在 `config_search_results` 中附加 `reason` 字段，给出客观技术理由。合法理由仅限：
+- 与当前已启用的配置冲突（如 cudagraph 与 static_kernel 互斥）
+- 该配置已在 baseline 中默认启用（no-op）
+- 模型/硬件不支持该配置
+禁止以 "LOW relevance" 或 "MEDIUM relevance" 为由跳过 — 只要相关度非零就必须测试。
 如果配置项涉及代码修改（如需要 patch 某个文件才能启用），也应积极尝试。
 
 搜索结果写入 results.json 的 `config_search_results` 字段。

@@ -73,6 +73,8 @@ arguments:
   3) 如果 latency 无变化（0% 或 ±1% 内）→ 进入第 4 步
   4) measure-throughput: 必须 fallback 到多请求 throughput 测量
      （使用 benchmark 脚本 + throughput_judge.py）
+     **risk_level 与是否执行 fallback 无关。即使 risk_level="low"
+     或预期收益为 0%，只要 latency 持平就必须执行 fallback。**
   5) judge: 基于 throughput 结果判定 KEEP/ROLLBACK
   6) 如果 throughput 也无变化 → 判定为 ROLLBACK，reason 记录:
      "Latency unchanged (0.0%), throughput unchanged (0.0%).

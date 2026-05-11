@@ -347,6 +347,8 @@ L5: vllm-optimize-l5
 
 禁止在 L4 QI PASS 后直接跳入收尾而跳过 L5 dispatch。
 
+**L5 quality-inspector 强制规则（2026-05-11 新增）**：L5 完成后的 quality-inspector dispatch 与 L1-L4 同等强制。禁止跳过 L5 QI 直接进入收尾。收尾 QI 仍独立存在（覆盖全局交付件）。
+
 ### 模式感知调度
 
 PM 根据 `mode` 参数决定实际调度行为：
