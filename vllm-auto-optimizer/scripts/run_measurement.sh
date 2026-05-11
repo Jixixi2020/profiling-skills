@@ -16,6 +16,7 @@ source "$SCRIPT_DIR/common.sh"
 SERVICE_MGR="$SCRIPT_DIR/service_manager.sh"
 EXTRACT_LATENCY="$SCRIPT_DIR/extract_decode_step_latency.py"
 EXTRACT_THROUGHPUT="$SCRIPT_DIR/extract_serve_throughput.py"
+EXTRACT_BENCH_OUTPUT="$SCRIPT_DIR/extract_bench_output.py"
 
 # ========== 参数解析 ==========
 CONTAINER="${1:?缺少容器名}"
@@ -266,7 +267,33 @@ SYNC_PID=$(cat "${SERVE_LOG}.sync_pid" 2>/dev/null || echo "")
 # 最终同步一次 serve 日志，确保采集窗口内的日志完整
 _sync_serve_log
 
-# 从 serve 日志提取 throughput（只取采集窗口内的行）
+# ========== 提取 vllm bench 标准输出（主指标） ==========
+BENCH_OUTPUT_FILE="${SERVE_LOG}.bench_output"
+BENCH_OUTPUT_OK=0
+if [[ "$BENCH_TYPE" == "script" ]]; then
+    docker cp "$CONTAINER:/tmp/_bench_output.log" "$BENCH_OUTPUT_FILE" 2>/dev/null || true
+    if [[ -s "$BENCH_OUTPUT_FILE" ]]; then
+        BENCH_JSON=$(python3 "$EXTRACT_BENCH_OUTPUT" "$BENCH_OUTPUT_FILE" 2>/dev/null || echo '{"parsed":false}')
+        BENCH_PARSED=$(echo "$BENCH_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print('true' if d.get('parsed') else 'false')" 2>/dev/null || echo "false")
+        if [[ "$BENCH_PARSED" == "true" ]]; then
+            BENCH_OUTPUT_OK=1
+            BENCH_TPUT=$(echo "$BENCH_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('output_token_throughput_tps',0))" 2>/dev/null || echo "0")
+            BENCH_TOTAL_TPUT=$(echo "$BENCH_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_token_throughput_tps',0))" 2>/dev/null || echo "0")
+            BENCH_DURATION=$(echo "$BENCH_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('benchmark_duration_s',0))" 2>/dev/null || echo "0")
+            BENCH_PEAK_TPUT=$(echo "$BENCH_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('peak_output_token_throughput_tps',0))" 2>/dev/null || echo "0")
+            BENCH_REQUESTS=$(echo "$BENCH_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('successful_requests',0))" 2>/dev/null || echo "0")
+            log_info "vllm bench 输出已解析: output_tput=$BENCH_TPUT tok/s, total_tput=$BENCH_TOTAL_TPUT tok/s, requests=$BENCH_REQUESTS"
+        else
+            log_warn "vllm bench 输出解析失败，回退到引擎日志采样"
+        fi
+    else
+        log_warn "vllm bench 输出文件为空或不存在，回退到引擎日志采样"
+    fi
+else
+    log_info "非 script 模式 (single request)，使用引擎日志采样"
+fi
+
+# 从 serve 日志提取 throughput（采样窗口内的行，作为备用/辅助指标）
 eval $(python3 -c "
 import subprocess, json, sys
 r = subprocess.run([sys.executable, '$EXTRACT_THROUGHPUT', '$SERVE_LOG', '--after-line', '${SERVE_LOG_LINE_BEFORE:-0}'], capture_output=True, text=True)
@@ -362,6 +389,18 @@ data = {
     'argmax_count': $ARGMAX_CNT,
     'valid_steps': $VALID_STEPS,
 }
+if '$BENCH_OUTPUT_OK' == '1':
+    data['bench_output_token_throughput_tps'] = $BENCH_TPUT
+    data['bench_total_token_throughput_tps'] = $BENCH_TOTAL_TPUT
+    data['bench_peak_output_token_throughput_tps'] = $BENCH_PEAK_TPUT
+    data['bench_duration_s'] = $BENCH_DURATION
+    data['bench_successful_requests'] = $BENCH_REQUESTS
+    data['bench_output_parsed'] = True
+    data['generation_throughput_avg_tps'] = $BENCH_TPUT
+    data['generation_throughput_max_tps'] = $BENCH_PEAK_TPUT
+    data['primary_metric_source'] = 'vllm_bench_output'
+else:
+    data['primary_metric_source'] = 'engine_log_sampling'
 with open('$PERF_JSON', 'w') as f:
     json.dump(data, f, indent=2)
 "
@@ -377,11 +416,55 @@ data = {
     'measurement_duration_s': $MEAS_DUR,
     'total_elapsed_s': $TOTAL_DUR,
 }
+# 优先使用 vllm bench 标准输出作为主指标
+if '$BENCH_OUTPUT_OK' == '1':
+    data['bench_output_token_throughput_tps'] = $BENCH_TPUT
+    data['bench_total_token_throughput_tps'] = $BENCH_TOTAL_TPUT
+    data['bench_peak_output_token_throughput_tps'] = $BENCH_PEAK_TPUT
+    data['bench_duration_s'] = $BENCH_DURATION
+    data['bench_successful_requests'] = $BENCH_REQUESTS
+    data['bench_output_parsed'] = True
+    # 用 bench output 覆盖旧字段，保证向后兼容
+    data['generation_throughput_avg_tps'] = $BENCH_TPUT
+    data['generation_throughput_max_tps'] = $BENCH_PEAK_TPUT
+    data['primary_metric_source'] = 'vllm_bench_output'
+else:
+    data['primary_metric_source'] = 'engine_log_sampling'
 with open('$PERF_JSON', 'w') as f:
     json.dump(data, f, indent=2)
 "
 fi
 log_info "perf.json 已保存: $PERF_JSON"
+step_end
+
+# ========== Step 13: 验证测量结果合理性 ==========
+step_start "验证测量结果"
+VALIDATE_SCRIPT="$SCRIPT_DIR/validate_benchmark.py"
+if [[ -f "$VALIDATE_SCRIPT" ]]; then
+    VALIDATE_RESULT=$(python3 "$VALIDATE_SCRIPT" "$PERF_JSON" 2>/dev/null || echo '{"overall":"ERROR"}')
+    VALIDATE_OVERALL=$(echo "$VALIDATE_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('overall','ERROR'))" 2>/dev/null || echo "ERROR")
+
+    # 将验证结果嵌入到 perf.json 中
+    python3 -c "
+import json
+with open('$PERF_JSON') as f:
+    perf = json.load(f)
+validate = json.loads('''$VALIDATE_RESULT''')
+perf['_validation'] = validate
+with open('$PERF_JSON', 'w') as f:
+    json.dump(perf, f, indent=2)
+"
+
+    if [[ "$VALIDATE_OVERALL" == "FAIL" ]]; then
+        log_error "测量结果验证失败 (FAIL): $(echo "$VALIDATE_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('summary',''))" 2>/dev/null)"
+    elif [[ "$VALIDATE_OVERALL" == "WARN" ]]; then
+        log_warn "测量结果有警告 (WARN): $(echo "$VALIDATE_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('summary',''))" 2>/dev/null)"
+    else
+        log_info "测量结果验证通过 (PASS)"
+    fi
+else
+    log_warn "验证脚本不可用: $VALIDATE_SCRIPT"
+fi
 step_end
 
 log_info "测量完成: max_tps=$MAX_TPS, avg_tps=$AVG_TPS, total=${TOTAL_DUR}s"
