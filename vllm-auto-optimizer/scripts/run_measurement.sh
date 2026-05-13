@@ -270,6 +270,7 @@ _sync_serve_log
 # ========== 提取 vllm bench 标准输出（主指标） ==========
 BENCH_OUTPUT_FILE="${SERVE_LOG}.bench_output"
 BENCH_OUTPUT_OK=0
+BENCH_TPUT=0; BENCH_TOTAL_TPUT=0; BENCH_DURATION=0; BENCH_PEAK_TPUT=0; BENCH_REQUESTS=0
 if [[ "$BENCH_TYPE" == "script" ]]; then
     docker cp "$CONTAINER:/tmp/_bench_output.log" "$BENCH_OUTPUT_FILE" 2>/dev/null || true
     if [[ -s "$BENCH_OUTPUT_FILE" ]]; then
@@ -440,25 +441,28 @@ step_end
 # ========== Step 13: 验证测量结果合理性 ==========
 step_start "验证测量结果"
 VALIDATE_SCRIPT="$SCRIPT_DIR/validate_benchmark.py"
+VALIDATE_TMP="${PERF_JSON}.validate_tmp"
 if [[ -f "$VALIDATE_SCRIPT" ]]; then
-    VALIDATE_RESULT=$(python3 "$VALIDATE_SCRIPT" "$PERF_JSON" 2>/dev/null || echo '{"overall":"ERROR"}')
-    VALIDATE_OVERALL=$(echo "$VALIDATE_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('overall','ERROR'))" 2>/dev/null || echo "ERROR")
+    python3 "$VALIDATE_SCRIPT" "$PERF_JSON" > "$VALIDATE_TMP" 2>/dev/null || echo '{"overall":"ERROR"}' > "$VALIDATE_TMP"
+    VALIDATE_OVERALL=$(python3 -c "import json; d=json.load(open('$VALIDATE_TMP')); print(d.get('overall','ERROR'))" 2>/dev/null || echo "ERROR")
 
-    # 将验证结果嵌入到 perf.json 中
+    # 将验证结果嵌入到 perf.json 中 (通过临时文件避免 shell 字符串转义问题)
     python3 -c "
 import json
 with open('$PERF_JSON') as f:
     perf = json.load(f)
-validate = json.loads('''$VALIDATE_RESULT''')
+with open('$VALIDATE_TMP') as f:
+    validate = json.load(f)
 perf['_validation'] = validate
 with open('$PERF_JSON', 'w') as f:
     json.dump(perf, f, indent=2)
 "
+    rm -f "$VALIDATE_TMP"
 
     if [[ "$VALIDATE_OVERALL" == "FAIL" ]]; then
-        log_error "测量结果验证失败 (FAIL): $(echo "$VALIDATE_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('summary',''))" 2>/dev/null)"
+        log_error "测量结果验证失败 (FAIL)"
     elif [[ "$VALIDATE_OVERALL" == "WARN" ]]; then
-        log_warn "测量结果有警告 (WARN): $(echo "$VALIDATE_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('summary',''))" 2>/dev/null)"
+        log_warn "测量结果有警告 (WARN)"
     else
         log_info "测量结果验证通过 (PASS)"
     fi
